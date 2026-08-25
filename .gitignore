@@ -7,6 +7,8 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+pack/*.ico
+pack/pix.png
 
 # 本机键位与窗口位置
 data/prefs.json

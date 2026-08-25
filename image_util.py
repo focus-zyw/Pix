@@ -1,9 +1,23 @@
-"""PNG 解码与缩放（无 Pillow 依赖）。"""
+"""PNG 解码、编码与缩放（无 Pillow 依赖）。"""
 
 from __future__ import annotations
 
 import struct
 import zlib
+
+
+def _chunk(tag: bytes, data: bytes) -> bytes:
+    return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+
+def encode_png(rgba: bytes, w: int, h: int) -> bytes:
+    raw = b"".join(b"\x00" + rgba[y * w * 4 : (y + 1) * w * 4] for y in range(h))
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+        + _chunk(b"IDAT", zlib.compress(raw, 9))
+        + _chunk(b"IEND", b"")
+    )
 
 
 def _paeth(a: int, b: int, c: int) -> int:
