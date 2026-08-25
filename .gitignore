@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+
+# 本机键位与窗口位置
+data/prefs.json
+
+.idea/
+.vscode/
+*.log
+Thumbs.db
+Desktop.ini
