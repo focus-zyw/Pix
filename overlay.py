@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import sys
 import threading
+import time
 from ctypes import wintypes
 from typing import Any, Callable
 
@@ -18,6 +19,7 @@ WM_LBUTTONDOWN = 0x0201
 WM_LBUTTONUP = 0x0202
 WM_RBUTTONUP = 0x0205
 WM_MOUSELEAVE = 0x02A3
+WM_WINDOWPOSCHANGING = 0x0046
 WM_APP = 0x8000
 WM_PIX_REFRESH = WM_APP + 1
 
@@ -36,6 +38,10 @@ ULW_ALPHA = 0x00000002
 AC_SRC_OVER = 0x00
 AC_SRC_ALPHA = 0x01
 SWP_NOACTIVATE = 0x0010
+SWP_NOMOVE = 0x0002
+SWP_NOSIZE = 0x0001
+SWP_TOPMOST_FLAGS = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+TOPMOST_GUARD_SEC = 2.0
 TME_LEAVE = 0x00000002
 DT_CALCRECT = 0x00000400
 DT_NOPREFIX = 0x00000800
@@ -148,6 +154,18 @@ class TRACKMOUSEEVENT(ctypes.Structure):
     ]
 
 
+class WINDOWPOS(ctypes.Structure):
+    _fields_ = [
+        ("hwnd", ctypes.c_void_p),
+        ("hwndInsertAfter", ctypes.c_void_p),
+        ("x", ctypes.c_int),
+        ("y", ctypes.c_int),
+        ("cx", ctypes.c_int),
+        ("cy", ctypes.c_int),
+        ("flags", wintypes.UINT),
+    ]
+
+
 class WNDCLASSEXW(ctypes.Structure):
     _fields_ = [
         ("cbSize", wintypes.UINT),
@@ -166,6 +184,20 @@ class WNDCLASSEXW(ctypes.Structure):
 
 
 _API_BOUND = False
+
+
+def _ensure_topmost(hwnd: int) -> None:
+    if not hwnd:
+        return
+    _user32().SetWindowPos(
+        hwnd,
+        ctypes.c_void_p(HWND_TOPMOST),
+        0,
+        0,
+        0,
+        0,
+        SWP_TOPMOST_FLAGS,
+    )
 
 
 def _user32():
@@ -590,6 +622,21 @@ class PixOverlay:
             raise OSError("CreateWindowExW 失败")
         self._hwnd = int(hwnd)
         user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
+        _ensure_topmost(self._hwnd)
+        self._start_topmost_guard()
+
+    def _start_topmost_guard(self) -> None:
+        def guard() -> None:
+            interval = max(0.5, TOPMOST_GUARD_SEC)
+            while not self._closed:
+                hwnd = self._hwnd
+                if hwnd:
+                    _ensure_topmost(hwnd)
+                deadline = time.monotonic() + interval
+                while time.monotonic() < deadline and not self._closed:
+                    time.sleep(0.1)
+
+        threading.Thread(target=guard, daemon=True, name="pix-topmost").start()
 
     def _capturing(self) -> bool:
         with self._lock:
@@ -603,6 +650,10 @@ class PixOverlay:
         user32 = _user32()
         if msg == WM_PIX_REFRESH:
             self._paint()
+            return 0
+        if msg == WM_WINDOWPOSCHANGING:
+            wp = ctypes.cast(lparam, ctypes.POINTER(WINDOWPOS)).contents
+            wp.hwndInsertAfter = ctypes.c_void_p(HWND_TOPMOST)
             return 0
         if msg == WM_NCHITTEST:
             x = ctypes.c_short(lparam & 0xFFFF).value
@@ -889,7 +940,7 @@ class PixOverlay:
             ctypes.byref(blend),
             ULW_ALPHA,
         )
-        user32.SetWindowPos(hwnd, ctypes.c_void_p(HWND_TOPMOST), 0, 0, 0, 0, 0x0001 | 0x0002 | SWP_NOACTIVATE)
+        _ensure_topmost(hwnd)
         gdi32.SelectObject(hdc, old)
         gdi32.DeleteObject(hbmp)
         gdi32.DeleteDC(hdc)

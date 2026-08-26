@@ -24,6 +24,7 @@ from pix.paths import prefs_path
 
 POLL_SEC = 1.0
 COACH_HZ = 60.0
+LIVE_MISS_STOP = 3
 
 DEFAULT_PREFS = {
     "attack_key": "LMB",
@@ -47,6 +48,7 @@ class PixApp:
         self._current_champion: str | None = None
         self._current_as: float | None = None
         self._live = False
+        self._live_misses = 0
         self._closed = False
         self._settings_open = False
         self._capturing: str | None = None
@@ -192,6 +194,26 @@ class PixApp:
                 snap["recovery"] = timing.get("recovery")
         return snap
 
+    def _stop_coach(self) -> None:
+        self._stop_coach_watcher()
+        with self._coach_lock:
+            self._coach = None
+            self._coach_push_key = None
+
+    def _apply_live(self, champion: str | None, as_: float | None, live: bool) -> None:
+        self._current_champion = champion
+        self._current_as = as_
+        self._live = live
+        if live:
+            self._live_misses = 0
+            self._close_settings()
+            if self._coach is None:
+                self._start_coach()
+            return
+        self._live_misses += 1
+        if self._live_misses >= LIVE_MISS_STOP:
+            self._stop_coach()
+
     def _poll_loop(self) -> None:
         while not self._stop.is_set():
             champion: str | None = None
@@ -203,14 +225,7 @@ class PixApp:
                 champion = (me.get("champion") or "").strip() or None
                 as_ = me.get("as") if me.get("as") is not None else None
                 live = bool(champion) and as_ is not None
-            self._current_champion = champion
-            self._current_as = as_
-            self._live = live
-            if live:
-                self._close_settings()
-
-            if live and self._coach is None:
-                self._start_coach()
+            self._apply_live(champion, as_, live)
             self._stop.wait(POLL_SEC)
 
     def _push(self, snapshot: dict[str, Any]) -> None:
@@ -302,9 +317,7 @@ class PixApp:
         self._stop.set()
         self._coach_loop_stop.set()
         self._stop_capture_watcher()
-        self._stop_coach_watcher()
-        with self._coach_lock:
-            self._coach = None
+        self._stop_coach()
 
     def start(self) -> None:
         if sys.platform != "win32":

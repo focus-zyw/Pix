@@ -6,10 +6,12 @@
 
 from __future__ import annotations
 
+import ctypes
 import sys
 import threading
 import time
 from collections.abc import Callable
+from ctypes import wintypes
 from typing import Any
 
 _VK: dict[str, int] = {
@@ -61,6 +63,113 @@ RI_MOUSE_BUTTON_5_DOWN = 0x0100
 WS_POPUP = 0x80000000
 WS_EX_NOACTIVATE = 0x08000000
 WS_EX_TOOLWINDOW = 0x00000080
+_RAW_BUF_MIN = 256
+
+
+class RAWINPUTHEADER(ctypes.Structure):
+    _fields_ = [
+        ("dwType", wintypes.DWORD),
+        ("dwSize", wintypes.DWORD),
+        ("hDevice", ctypes.c_void_p),
+        ("wParam", ctypes.c_size_t),
+    ]
+
+
+class _BTN(ctypes.Structure):
+    _fields_ = [("usButtonFlags", wintypes.USHORT), ("usButtonData", wintypes.USHORT)]
+
+
+class _BU(ctypes.Union):
+    _fields_ = [("ulButtons", wintypes.ULONG), ("btn", _BTN)]
+
+
+class RAWMOUSE(ctypes.Structure):
+    _fields_ = [
+        ("usFlags", wintypes.USHORT),
+        ("_pad", wintypes.USHORT),
+        ("u", _BU),
+        ("ulRawButtons", wintypes.ULONG),
+        ("lLastX", wintypes.LONG),
+        ("lLastY", wintypes.LONG),
+        ("ulExtraInformation", wintypes.ULONG),
+    ]
+
+
+class RAWKEYBOARD(ctypes.Structure):
+    _fields_ = [
+        ("MakeCode", wintypes.USHORT),
+        ("Flags", wintypes.USHORT),
+        ("Reserved", wintypes.USHORT),
+        ("VKey", wintypes.USHORT),
+        ("Message", wintypes.UINT),
+        ("ExtraInformation", wintypes.ULONG),
+    ]
+
+
+class _DATA(ctypes.Union):
+    _fields_ = [("mouse", RAWMOUSE), ("keyboard", RAWKEYBOARD)]
+
+
+class RAWINPUT(ctypes.Structure):
+    _fields_ = [("header", RAWINPUTHEADER), ("data", _DATA)]
+
+
+class RAWINPUTDEVICE(ctypes.Structure):
+    _fields_ = [
+        ("usUsagePage", wintypes.USHORT),
+        ("usUsage", wintypes.USHORT),
+        ("dwFlags", wintypes.DWORD),
+        ("hwndTarget", ctypes.c_void_p),
+    ]
+
+
+_GET_RAW_INPUT_DATA: Any = None
+
+
+def _get_raw_input_data() -> Any:
+    global _GET_RAW_INPUT_DATA
+    if _GET_RAW_INPUT_DATA is None:
+        fn = ctypes.WinDLL("user32", use_last_error=True).GetRawInputData
+        fn.argtypes = [
+            ctypes.c_void_p,
+            wintypes.UINT,
+            ctypes.c_void_p,
+            ctypes.POINTER(wintypes.UINT),
+            wintypes.UINT,
+        ]
+        fn.restype = wintypes.UINT
+        _GET_RAW_INPUT_DATA = fn
+    return _GET_RAW_INPUT_DATA
+
+
+def raw_input_vks(buf: bytes) -> list[int]:
+    """Parse one RAWINPUT packet into virtual-key codes that just went down."""
+    n = ctypes.sizeof(RAWINPUT)
+    if len(buf) < ctypes.sizeof(RAWINPUTHEADER):
+        return []
+    if len(buf) < n:
+        buf = buf + bytes(n - len(buf))
+    raw = RAWINPUT.from_buffer_copy(buf[:n])
+    vks: list[int] = []
+    if raw.header.dwType == RIM_TYPEMOUSE:
+        flags = int(raw.data.mouse.u.btn.usButtonFlags)
+        if flags & RI_MOUSE_LEFT_BUTTON_DOWN:
+            vks.append(0x01)
+        if flags & RI_MOUSE_RIGHT_BUTTON_DOWN:
+            vks.append(0x02)
+        if flags & RI_MOUSE_MIDDLE_BUTTON_DOWN:
+            vks.append(0x04)
+        if flags & RI_MOUSE_BUTTON_4_DOWN:
+            vks.append(0x05)
+        if flags & RI_MOUSE_BUTTON_5_DOWN:
+            vks.append(0x06)
+    elif raw.header.dwType == RIM_TYPEKEYBOARD:
+        if int(raw.data.keyboard.Flags) & RI_KEY_BREAK:
+            return []
+        vk = int(raw.data.keyboard.VKey)
+        if vk and vk != 0xFF:
+            vks.append(vk)
+    return vks
 
 
 def is_input_available() -> bool:
@@ -153,6 +262,7 @@ class GlobalKeyWatcher:
         self._class_buf: Any = None
         self._title_buf: Any = None
         self._last_fire: dict[int, float] = {}
+        self._raw_buf = ctypes.create_string_buffer(_RAW_BUF_MIN)
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -318,14 +428,6 @@ class GlobalKeyWatcher:
             return False
         self._hwnd = int(hwnd)
 
-        class RAWINPUTDEVICE(ctypes.Structure):
-            _fields_ = [
-                ("usUsagePage", wintypes.USHORT),
-                ("usUsage", wintypes.USHORT),
-                ("dwFlags", wintypes.DWORD),
-                ("hwndTarget", ctypes.c_void_p),
-            ]
-
         devices = (RAWINPUTDEVICE * 2)()
         devices[0].usUsagePage = 0x01
         devices[0].usUsage = 0x02
@@ -348,90 +450,21 @@ class GlobalKeyWatcher:
         return True
 
     def _on_wm_input(self, lparam: int) -> None:
-        import ctypes
-        from ctypes import wintypes
-
-        user32 = ctypes.WinDLL("user32", use_last_error=True)
-
-        class RAWINPUTHEADER(ctypes.Structure):
-            _fields_ = [
-                ("dwType", wintypes.DWORD),
-                ("dwSize", wintypes.DWORD),
-                ("hDevice", ctypes.c_void_p),
-                ("wParam", ctypes.c_size_t),
-            ]
-
-        class _BTN(ctypes.Structure):
-            _fields_ = [("usButtonFlags", wintypes.USHORT), ("usButtonData", wintypes.USHORT)]
-
-        class _BU(ctypes.Union):
-            _fields_ = [("ulButtons", wintypes.ULONG), ("btn", _BTN)]
-
-        class RAWMOUSE(ctypes.Structure):
-            _fields_ = [
-                ("usFlags", wintypes.USHORT),
-                ("_pad", wintypes.USHORT),
-                ("u", _BU),
-                ("ulRawButtons", wintypes.ULONG),
-                ("lLastX", wintypes.LONG),
-                ("lLastY", wintypes.LONG),
-                ("ulExtraInformation", wintypes.ULONG),
-            ]
-
-        class RAWKEYBOARD(ctypes.Structure):
-            _fields_ = [
-                ("MakeCode", wintypes.USHORT),
-                ("Flags", wintypes.USHORT),
-                ("Reserved", wintypes.USHORT),
-                ("VKey", wintypes.USHORT),
-                ("Message", wintypes.UINT),
-                ("ExtraInformation", wintypes.ULONG),
-            ]
-
-        class _DATA(ctypes.Union):
-            _fields_ = [("mouse", RAWMOUSE), ("keyboard", RAWKEYBOARD)]
-
-        class RAWINPUT(ctypes.Structure):
-            _fields_ = [("header", RAWINPUTHEADER), ("data", _DATA)]
-
-        user32.GetRawInputData.argtypes = [
-            ctypes.c_void_p,
-            wintypes.UINT,
-            ctypes.c_void_p,
-            ctypes.POINTER(wintypes.UINT),
-            wintypes.UINT,
-        ]
-        user32.GetRawInputData.restype = wintypes.UINT
-
+        get_data = _get_raw_input_data()
         hraw = ctypes.c_void_p(lparam & 0xFFFFFFFFFFFFFFFF)
         size = wintypes.UINT(0)
         header_sz = ctypes.sizeof(RAWINPUTHEADER)
-        user32.GetRawInputData(hraw, RID_INPUT, None, ctypes.byref(size), header_sz)
+        get_data(hraw, RID_INPUT, None, ctypes.byref(size), header_sz)
         if not size.value:
             return
-        buf = ctypes.create_string_buffer(size.value)
-        got = user32.GetRawInputData(hraw, RID_INPUT, buf, ctypes.byref(size), header_sz)
+        if size.value > len(self._raw_buf):
+            self._raw_buf = ctypes.create_string_buffer(size.value)
+        size.value = len(self._raw_buf)
+        got = get_data(hraw, RID_INPUT, self._raw_buf, ctypes.byref(size), header_sz)
         if got == 0xFFFFFFFF or got == 0:
             return
-        raw = ctypes.cast(buf, ctypes.POINTER(RAWINPUT)).contents
-        if raw.header.dwType == RIM_TYPEMOUSE:
-            flags = int(raw.data.mouse.u.btn.usButtonFlags)
-            if flags & RI_MOUSE_LEFT_BUTTON_DOWN:
-                self._fire(0x01)
-            if flags & RI_MOUSE_RIGHT_BUTTON_DOWN:
-                self._fire(0x02)
-            if flags & RI_MOUSE_MIDDLE_BUTTON_DOWN:
-                self._fire(0x04)
-            if flags & RI_MOUSE_BUTTON_4_DOWN:
-                self._fire(0x05)
-            if flags & RI_MOUSE_BUTTON_5_DOWN:
-                self._fire(0x06)
-        elif raw.header.dwType == RIM_TYPEKEYBOARD:
-            if int(raw.data.keyboard.Flags) & RI_KEY_BREAK:
-                return
-            vk = int(raw.data.keyboard.VKey)
-            if vk and vk != 0xFF:
-                self._fire(vk)
+        for vk in raw_input_vks(self._raw_buf.raw[:got]):
+            self._fire(vk)
 
     def _raw_message_loop(self) -> None:
         import ctypes
@@ -475,14 +508,6 @@ class GlobalKeyWatcher:
         hwnd = self._hwnd
         self._hwnd = 0
         if hwnd:
-            class RAWINPUTDEVICE(ctypes.Structure):
-                _fields_ = [
-                    ("usUsagePage", wintypes.USHORT),
-                    ("usUsage", wintypes.USHORT),
-                    ("dwFlags", wintypes.DWORD),
-                    ("hwndTarget", ctypes.c_void_p),
-                ]
-
             devices = (RAWINPUTDEVICE * 2)()
             devices[0].usUsagePage = 0x01
             devices[0].usUsage = 0x02

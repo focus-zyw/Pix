@@ -36,9 +36,14 @@ def _close_client() -> None:
 def fetch_all_game_data() -> dict[str, Any] | None:
     try:
         r = _client().get(f"{LIVE_BASE}/allgamedata")
-        if r.status_code != 200:
-            return None
-        return r.json()
+        try:
+            if r.status_code != 200:
+                return None
+            return r.json()
+        finally:
+            r.close()
+    except httpx.RequestError:
+        return None
     except Exception:  # noqa: BLE001
         _close_client()
         return None
