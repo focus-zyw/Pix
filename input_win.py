@@ -64,6 +64,113 @@ WS_POPUP = 0x80000000
 WS_EX_NOACTIVATE = 0x08000000
 WS_EX_TOOLWINDOW = 0x00000080
 _RAW_BUF_MIN = 256
+_MOUSE_DOWN_FLAGS = (
+    RI_MOUSE_LEFT_BUTTON_DOWN
+    | RI_MOUSE_RIGHT_BUTTON_DOWN
+    | RI_MOUSE_MIDDLE_BUTTON_DOWN
+    | RI_MOUSE_BUTTON_4_DOWN
+    | RI_MOUSE_BUTTON_5_DOWN
+)
+
+_WNDPROC = ctypes.WINFUNCTYPE(
+    ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t
+)
+
+
+class _MSG_POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+class _MSG(ctypes.Structure):
+    _fields_ = [
+        ("hwnd", ctypes.c_void_p),
+        ("message", ctypes.c_uint),
+        ("wParam", ctypes.c_size_t),
+        ("lParam", ctypes.c_ssize_t),
+        ("time", ctypes.c_uint),
+        ("pt", _MSG_POINT),
+    ]
+
+
+class _WNDCLASSEXW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.UINT),
+        ("style", wintypes.UINT),
+        ("lpfnWndProc", _WNDPROC),
+        ("cbClsExtra", ctypes.c_int),
+        ("cbWndExtra", ctypes.c_int),
+        ("hInstance", ctypes.c_void_p),
+        ("hIcon", ctypes.c_void_p),
+        ("hCursor", ctypes.c_void_p),
+        ("hbrBackground", ctypes.c_void_p),
+        ("lpszMenuName", wintypes.LPCWSTR),
+        ("lpszClassName", wintypes.LPCWSTR),
+        ("hIconSm", ctypes.c_void_p),
+    ]
+
+
+_USER32: Any = None
+_KERNEL32: Any = None
+_RAW_WINAPI_BOUND = False
+
+
+def _user32() -> Any:
+    global _USER32
+    if _USER32 is None:
+        _USER32 = ctypes.WinDLL("user32", use_last_error=True)
+    return _USER32
+
+
+def _kernel32() -> Any:
+    global _KERNEL32
+    if _KERNEL32 is None:
+        _KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    return _KERNEL32
+
+
+def _bind_raw_winapi() -> None:
+    global _RAW_WINAPI_BOUND
+    if _RAW_WINAPI_BOUND:
+        return
+    user32 = _user32()
+    kernel32 = _kernel32()
+    kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+    kernel32.GetModuleHandleW.restype = ctypes.c_void_p
+    user32.RegisterClassExW.argtypes = [ctypes.POINTER(_WNDCLASSEXW)]
+    user32.RegisterClassExW.restype = wintypes.ATOM
+    user32.CreateWindowExW.argtypes = [
+        wintypes.DWORD,
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    user32.CreateWindowExW.restype = ctypes.c_void_p
+    user32.RegisterRawInputDevices.argtypes = [
+        ctypes.POINTER(RAWINPUTDEVICE),
+        wintypes.UINT,
+        wintypes.UINT,
+    ]
+    user32.RegisterRawInputDevices.restype = wintypes.BOOL
+    user32.GetMessageW.argtypes = [ctypes.POINTER(_MSG), ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint]
+    user32.GetMessageW.restype = ctypes.c_int
+    user32.TranslateMessage.argtypes = [ctypes.POINTER(_MSG)]
+    user32.DispatchMessageW.argtypes = [ctypes.POINTER(_MSG)]
+    user32.DispatchMessageW.restype = ctypes.c_ssize_t
+    user32.PostMessageW.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint,
+        ctypes.c_size_t,
+        ctypes.c_ssize_t,
+    ]
+    _RAW_WINAPI_BOUND = True
 
 
 class RAWINPUTHEADER(ctypes.Structure):
@@ -142,14 +249,35 @@ def _get_raw_input_data() -> Any:
     return _GET_RAW_INPUT_DATA
 
 
-def raw_input_vks(buf: bytes) -> list[int]:
-    """Parse one RAWINPUT packet into virtual-key codes that just went down."""
+def _as_raw_input(buf: bytes) -> RAWINPUT | None:
     n = ctypes.sizeof(RAWINPUT)
     if len(buf) < ctypes.sizeof(RAWINPUTHEADER):
-        return []
+        return None
     if len(buf) < n:
         buf = buf + bytes(n - len(buf))
-    raw = RAWINPUT.from_buffer_copy(buf[:n])
+    return RAWINPUT.from_buffer_copy(buf[:n])
+
+
+def raw_input_is_key_down(buf: bytes) -> bool:
+    """True if this packet is a mouse-button or key down (ignore pointer moves)."""
+    raw = _as_raw_input(buf)
+    if raw is None:
+        return False
+    if raw.header.dwType == RIM_TYPEMOUSE:
+        return bool(int(raw.data.mouse.u.btn.usButtonFlags) & _MOUSE_DOWN_FLAGS)
+    if raw.header.dwType == RIM_TYPEKEYBOARD:
+        if int(raw.data.keyboard.Flags) & RI_KEY_BREAK:
+            return False
+        vk = int(raw.data.keyboard.VKey)
+        return bool(vk and vk != 0xFF)
+    return False
+
+
+def raw_input_vks(buf: bytes) -> list[int]:
+    """Parse one RAWINPUT packet into virtual-key codes that just went down."""
+    raw = _as_raw_input(buf)
+    if raw is None:
+        return []
     vks: list[int] = []
     if raw.header.dwType == RIM_TYPEMOUSE:
         flags = int(raw.data.mouse.u.btn.usButtonFlags)
@@ -282,16 +410,8 @@ class GlobalKeyWatcher:
         hwnd = self._hwnd
         if hwnd:
             try:
-                import ctypes
-
-                user32 = ctypes.WinDLL("user32", use_last_error=True)
-                user32.PostMessageW.argtypes = [
-                    ctypes.c_void_p,
-                    ctypes.c_uint,
-                    ctypes.c_size_t,
-                    ctypes.c_ssize_t,
-                ]
-                user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+                _bind_raw_winapi()
+                _user32().PostMessageW(hwnd, WM_CLOSE, 0, 0)
             except Exception:  # noqa: BLE001
                 pass
         th = self._thread
@@ -338,32 +458,11 @@ class GlobalKeyWatcher:
             self._teardown_raw()
 
     def _start_raw(self) -> bool:
-        import ctypes
-        from ctypes import wintypes
-
-        user32 = ctypes.WinDLL("user32", use_last_error=True)
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        wndproc_t = ctypes.WINFUNCTYPE(
-            ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t
-        )
-        def_proc = wndproc_t(("DefWindowProcW", user32))
+        _bind_raw_winapi()
+        user32 = _user32()
+        kernel32 = _kernel32()
+        def_proc = _WNDPROC(("DefWindowProcW", user32))
         self._def_proc = def_proc
-
-        class WNDCLASSEXW(ctypes.Structure):
-            _fields_ = [
-                ("cbSize", wintypes.UINT),
-                ("style", wintypes.UINT),
-                ("lpfnWndProc", wndproc_t),
-                ("cbClsExtra", ctypes.c_int),
-                ("cbWndExtra", ctypes.c_int),
-                ("hInstance", ctypes.c_void_p),
-                ("hIcon", ctypes.c_void_p),
-                ("hCursor", ctypes.c_void_p),
-                ("hbrBackground", ctypes.c_void_p),
-                ("lpszMenuName", wintypes.LPCWSTR),
-                ("lpszClassName", wintypes.LPCWSTR),
-                ("hIconSm", ctypes.c_void_p),
-            ]
 
         def _cb(hwnd: int, msg: int, wparam: int, lparam: int) -> int:
             if msg == WM_INPUT:
@@ -375,40 +474,21 @@ class GlobalKeyWatcher:
                 return 0
             return int(def_proc(hwnd, msg, wparam, lparam))
 
-        self._wndproc_ref = wndproc_t(_cb)
+        self._wndproc_ref = _WNDPROC(_cb)
         self._class_name = f"AtkRawIn{id(self):x}"
         self._class_buf = ctypes.create_unicode_buffer(self._class_name)
         self._title_buf = ctypes.create_unicode_buffer("atk-rawin")
-        kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
-        kernel32.GetModuleHandleW.restype = ctypes.c_void_p
         hinst = kernel32.GetModuleHandleW(None)
-        wc = WNDCLASSEXW()
-        wc.cbSize = ctypes.sizeof(WNDCLASSEXW)
+        wc = _WNDCLASSEXW()
+        wc.cbSize = ctypes.sizeof(_WNDCLASSEXW)
         wc.lpfnWndProc = self._wndproc_ref
         wc.hInstance = hinst
         wc.lpszClassName = ctypes.cast(self._class_buf, wintypes.LPCWSTR)
-        user32.RegisterClassExW.argtypes = [ctypes.POINTER(WNDCLASSEXW)]
-        user32.RegisterClassExW.restype = wintypes.ATOM
         atom = user32.RegisterClassExW(ctypes.byref(wc))
         if not atom:
             self._class_name = ""
             return False
 
-        user32.CreateWindowExW.argtypes = [
-            wintypes.DWORD,
-            wintypes.LPCWSTR,
-            wintypes.LPCWSTR,
-            wintypes.DWORD,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-        ]
-        user32.CreateWindowExW.restype = ctypes.c_void_p
         hwnd = user32.CreateWindowExW(
             WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
             self._class_buf,
@@ -437,12 +517,6 @@ class GlobalKeyWatcher:
         devices[1].usUsage = 0x06
         devices[1].dwFlags = RIDEV_INPUTSINK
         devices[1].hwndTarget = hwnd
-        user32.RegisterRawInputDevices.argtypes = [
-            ctypes.POINTER(RAWINPUTDEVICE),
-            wintypes.UINT,
-            wintypes.UINT,
-        ]
-        user32.RegisterRawInputDevices.restype = wintypes.BOOL
         ok = bool(user32.RegisterRawInputDevices(devices, 2, ctypes.sizeof(RAWINPUTDEVICE)))
         if not ok:
             self._teardown_raw()
@@ -463,34 +537,16 @@ class GlobalKeyWatcher:
         got = get_data(hraw, RID_INPUT, self._raw_buf, ctypes.byref(size), header_sz)
         if got == 0xFFFFFFFF or got == 0:
             return
-        for vk in raw_input_vks(self._raw_buf.raw[:got]):
+        packet = self._raw_buf.raw[:got]
+        if not raw_input_is_key_down(packet):
+            return
+        for vk in raw_input_vks(packet):
             self._fire(vk)
 
     def _raw_message_loop(self) -> None:
-        import ctypes
-
-        user32 = ctypes.WinDLL("user32", use_last_error=True)
-
-        class POINT(ctypes.Structure):
-            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
-
-        class MSG(ctypes.Structure):
-            _fields_ = [
-                ("hwnd", ctypes.c_void_p),
-                ("message", ctypes.c_uint),
-                ("wParam", ctypes.c_size_t),
-                ("lParam", ctypes.c_ssize_t),
-                ("time", ctypes.c_uint),
-                ("pt", POINT),
-            ]
-
-        user32.GetMessageW.argtypes = [ctypes.POINTER(MSG), ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint]
-        user32.GetMessageW.restype = ctypes.c_int
-        user32.TranslateMessage.argtypes = [ctypes.POINTER(MSG)]
-        user32.DispatchMessageW.argtypes = [ctypes.POINTER(MSG)]
-        user32.DispatchMessageW.restype = ctypes.c_ssize_t
-
-        msg = MSG()
+        _bind_raw_winapi()
+        user32 = _user32()
+        msg = _MSG()
         while not self._stop.is_set():
             r = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
             if r <= 0:
@@ -501,10 +557,9 @@ class GlobalKeyWatcher:
     def _teardown_raw(self) -> None:
         if sys.platform != "win32":
             return
-        import ctypes
-        from ctypes import wintypes
-
-        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        _bind_raw_winapi()
+        user32 = _user32()
+        kernel32 = _kernel32()
         hwnd = self._hwnd
         self._hwnd = 0
         if hwnd:
@@ -525,7 +580,6 @@ class GlobalKeyWatcher:
                 pass
         if self._class_name:
             try:
-                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
                 user32.UnregisterClassW(self._class_name, kernel32.GetModuleHandleW(None))
             except Exception:  # noqa: BLE001
                 pass

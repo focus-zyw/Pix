@@ -49,20 +49,32 @@ def fetch_all_game_data() -> dict[str, Any] | None:
         return None
 
 
+def _player_names(p: dict[str, Any]) -> set[str]:
+    names: set[str] = set()
+    for key in ("summonerName", "riotId", "riotIdGameName"):
+        v = (p.get(key) or "").strip()
+        if not v:
+            continue
+        names.add(v)
+        if "#" in v:
+            names.add(v.split("#", 1)[0].strip())
+    return {n for n in names if n}
+
+
 def parse_me(data: dict[str, Any]) -> dict[str, Any] | None:
     active = data.get("activePlayer") or {}
-    my_name = (active.get("summonerName") or "").strip()
     stats = active.get("championStats") or {}
+    mine = _player_names(active)
     me: dict[str, Any] | None = None
     for p in data.get("allPlayers") or []:
-        if (p.get("summonerName") or "").strip() == my_name:
+        if mine and (_player_names(p) & mine):
             me = {
                 "champion": (p.get("championName") or "").strip() or "?",
                 "is_me": True,
             }
             break
     if me is None:
-        if not my_name and not stats:
+        if not mine and not stats:
             return None
         me = {
             "champion": (active.get("championName") or "").strip() or "?",
